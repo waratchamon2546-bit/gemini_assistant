@@ -1,1 +1,0 @@
-const String geminiApiKey = 'AIzaSyCa28K5GaSqCiQC2bv2113UNf8efUmlVK4'; // 🔐 ใส่ API Key ที่คุณขอไว้
