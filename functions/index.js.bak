@@ -1,0 +1,190 @@
+const functions = require("firebase-functions");
+const admin = require("firebase-admin");
+const fetch = require("node-fetch");
+require("dotenv").config();
+
+/* ===============================
+   ENV & INIT
+================================ */
+
+// ใช้ Firestore Emulator (ตอน local)
+process.env.FIRESTORE_EMULATOR_HOST = "127.0.0.1:8080";
+
+// init firebase admin (ห้ามซ้ำ)
+admin.initializeApp();
+const db = admin.firestore();
+
+// Gemini API Key (อ่านจาก .env)
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+console.log("Gemini key loaded:", !!GEMINI_API_KEY);
+
+// Gemini 2.5 Flash
+const GEMINI_ENDPOINT =
+  "https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent";
+
+/* ===============================
+   AI: Extract Symptoms
+================================ */
+
+async function extractSymptomsWithGemini(message) {
+  const prompt = `
+คุณคือระบบวิเคราะห์อาการของเด็ก
+
+จากข้อความด้านล่าง:
+- ดึงเฉพาะ "อาการ" ที่เกี่ยวข้องกับสุขภาพ
+- ตอบกลับเป็น JSON array เท่านั้น
+- ใช้คำอาการที่เป็นมาตรฐาน (ภาษาไทย)
+- ถ้าไม่พบอาการ ให้ตอบ []
+
+ข้อความ:
+"${message}"
+
+ตัวอย่างคำตอบที่ถูกต้อง:
+["ไข้สูง","อาเจียน"]
+`;
+
+  const response = await fetch(
+    `${GEMINI_ENDPOINT}?key=${GEMINI_API_KEY}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+      }),
+    }
+  );
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    console.error("Extract Gemini error:", data);
+    return [];
+  }
+
+  const text =
+    data.candidates?.[0]?.content?.parts?.[0]?.text ?? "[]";
+
+  try {
+    const symptoms = JSON.parse(text);
+    return Array.isArray(symptoms) ? symptoms : [];
+  } catch (e) {
+    console.error("Parse symptom JSON failed:", text);
+    return [];
+  }
+}
+
+/* ===============================
+   MAIN FUNCTION
+================================ */
+
+exports.askGemini = functions.https.onRequest(async (req, res) => {
+  try {
+    /* ---------- CORS ---------- */
+    res.set("Access-Control-Allow-Origin", "*");
+    res.set("Access-Control-Allow-Headers", "Content-Type");
+
+    if (req.method === "OPTIONS") {
+      res.status(204).send("");
+      return;
+    }
+
+    /* ---------- 1. รับ message ---------- */
+    const message = req.body?.message;
+    if (!message) {
+      res.status(400).json({ error: "No message provided" });
+      return;
+    }
+
+    console.log("User message:", message);
+
+    /* ---------- 2. AI Extract Symptoms ---------- */
+    const extractedSymptoms = await extractSymptomsWithGemini(message);
+    console.log("AI extracted symptoms:", extractedSymptoms);
+
+    /* ---------- 3. Search Firestore ---------- */
+    let diseaseData = null;
+
+    if (extractedSymptoms.length > 0) {
+      const snapshot = await db
+        .collection("diseases")
+        .where("symptoms", "array-contains-any", extractedSymptoms)
+        .limit(1)
+        .get();
+
+      if (!snapshot.empty) {
+        diseaseData = snapshot.docs[0].data();
+        console.log("Found disease from Firestore:", diseaseData.name);
+      } else {
+        console.log("No disease matched in Firestore");
+      }
+    }
+
+    /* ---------- 4. Build Prompt ---------- */
+    let prompt = "";
+
+    if (diseaseData) {
+      // ✅ ใช้ Firestore เป็น knowledge
+      prompt = `
+คุณคือผู้ช่วยด้านสุขภาพสำหรับเด็ก
+ใช้ข้อมูลต่อไปนี้ในการตอบ (ห้ามเดานอกข้อมูล)
+
+ชื่อโรค:
+${diseaseData.name}
+
+อาการที่พบบ่อย:
+${diseaseData.symptoms.join(", ")}
+
+การดูแลเบื้องต้น:
+${diseaseData.care}
+
+สัญญาณอันตราย:
+${diseaseData.red_flags}
+
+คำถามจากผู้ปกครอง:
+"${message}"
+
+ตอบอย่างสุภาพ เข้าใจง่าย และแนะนำให้พบแพทย์เมื่อจำเป็น
+`;
+    } else {
+      // ❌ ไม่เจอ → ให้ Gemini ตอบทั่วไป
+      prompt = `
+คุณคือผู้ช่วยด้านสุขภาพสำหรับเด็ก
+ห้ามวินิจฉัยโรค
+ให้คำแนะนำเบื้องต้นอย่างปลอดภัย
+
+คำถามจากผู้ปกครอง:
+"${message}"
+`;
+    }
+
+    /* ---------- 5. Ask Gemini (Final Answer) ---------- */
+    const response = await fetch(
+      `${GEMINI_ENDPOINT}?key=${GEMINI_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+        }),
+      }
+    );
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      console.error("Gemini error:", data);
+      res.status(500).json({ error: data });
+      return;
+    }
+
+    /* ---------- 6. Reply ---------- */
+    const reply =
+      data.candidates?.[0]?.content?.parts?.[0]?.text ??
+      "ขออภัย ไม่สามารถตอบได้ในขณะนี้";
+
+    res.json({ reply });
+  } catch (error) {
+    console.error("askGemini error:", error);
+    res.status(500).json({ error: error.toString() });
+  }
+});
